@@ -18,6 +18,7 @@ package sysfs
 import (
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"golang.org/x/sync/errgroup"
@@ -62,6 +63,52 @@ type SystemCPUCpufreqStats struct {
 	Governor                 string
 	RelatedCpus              string
 	SetSpeed                 string
+}
+
+// copyCPUFreq (internal) contains info for copying frequency info for threaded cores
+type copyCPUFreq struct {
+	enabled   bool // whether to copy or not, zero value is false i.e. no copy
+	fromIndex int  // the cpu index from which to copy, if copying is enabled
+}
+
+// copyFrom (internal) shallow-copies fields from given stats, except for
+// Name and RelatedCpus
+func (dst SystemCPUCpufreqStats) copyFrom(src *SystemCPUCpufreqStats) {
+	// store values which are not to be copied
+	name := dst.Name
+	related := dst.RelatedCpus
+	// shallow-copy all fields
+	dst = *src
+	// restore values which are not to be copied
+	dst.Name = name
+	dst.RelatedCpus = related
+}
+
+// getCPUsToCopy (internal) returns a slice of copyCPUFreq structs telling
+// which cpu to copy. When a topology thread siblings list is e.g. "1,45",
+// values for cpu 45 are marked to be copied from cpu 1. The returned slice
+// index 45 then has enabled = true and fromIndex = 1.
+func getCPUsToCopy(topologies []*CPUTopology, numCpus int) []copyCPUFreq {
+	freqCopies := make([]copyCPUFreq, numCpus)
+	topologyCount := len(topologies)
+	for i := 0; i < topologyCount; i++ {
+		threadIds := strings.Split(topologies[i].ThreadSiblingsList, ",")
+
+		threadCount := len(threadIds)
+		if threadCount > 1 {
+			copyFromIndex, err := strconv.Atoi(threadIds[0])
+			if err == nil && copyFromIndex >= 0 && copyFromIndex < numCpus {
+				for j := 1; j < threadCount; j++ {
+					index, err := strconv.Atoi(threadIds[j])
+					if err == nil && index >= 0 && index < numCpus {
+						freqCopies[index].enabled = true
+						freqCopies[index].fromIndex = copyFromIndex
+					}
+				}
+			}
+		}
+	}
+	return freqCopies
 }
 
 // CPUs returns a slice of all CPUs in /sys/devices/system/cpu
@@ -139,8 +186,8 @@ func parseCPUThermalThrottle(cpuPath string) (*CPUThermalThrottle, error) {
 	return &t, nil
 }
 
-// SystemCpufreq returns CPU frequency metrics for all CPUs.
-func (fs FS) SystemCpufreq() ([]SystemCPUCpufreqStats, error) {
+// SystemCpufreq returns CPU frequency metrics for all CPUs. Given topologies are used for optimizing.
+func (fs FS) SystemCpufreq(topologies []*CPUTopology) ([]SystemCPUCpufreqStats, error) {
 	var g errgroup.Group
 
 	cpus, err := filepath.Glob(fs.sys.Path("devices/system/cpu/cpu[0-9]*"))
@@ -148,9 +195,16 @@ func (fs FS) SystemCpufreq() ([]SystemCPUCpufreqStats, error) {
 		return nil, err
 	}
 
+	// figure out which cpus can get their info as copies from other cpus
+	freqCopies := getCPUsToCopy(topologies, len(cpus))
+
 	systemCpufreq := make([]SystemCPUCpufreqStats, len(cpus))
-	for i, cpu := range cpus {
+	for _, cpu := range cpus {
 		cpuName := strings.TrimPrefix(filepath.Base(cpu), "cpu")
+		cpuIndex, err := strconv.Atoi(cpuName)
+		if err != nil {
+			return nil, err
+		}
 
 		cpuCpufreqPath := filepath.Join(cpu, "cpufreq")
 		_, err = os.Stat(cpuCpufreqPath)
@@ -160,15 +214,23 @@ func (fs FS) SystemCpufreq() ([]SystemCPUCpufreqStats, error) {
 			return nil, err
 		}
 
+		// skip cpus which are marked for copying from another cpu
+		if freqCopies[cpuIndex].enabled {
+			systemCpufreq[cpuIndex].Name = cpuName
+			// read related_cpus, it is the only field which will differ in sysfs
+			relatedCpus, _ := util.SysReadFile(filepath.Join(cpuCpufreqPath, "related_cpus"))
+			systemCpufreq[cpuIndex].RelatedCpus = relatedCpus
+			continue
+		}
+
 		// Execute the parsing of each CPU in parallel.
 		// This is done because the kernel intentionally delays access to each CPU by
 		// 50 milliseconds to avoid DDoSing possibly expensive functions.
-		i := i // https://golang.org/doc/faq#closures_and_goroutines
 		g.Go(func() error {
 			cpufreq, err := parseCpufreqCpuinfo(cpuCpufreqPath)
 			if err == nil {
 				cpufreq.Name = cpuName
-				systemCpufreq[i] = *cpufreq
+				systemCpufreq[cpuIndex] = *cpufreq
 			}
 			return err
 		})
@@ -176,6 +238,13 @@ func (fs FS) SystemCpufreq() ([]SystemCPUCpufreqStats, error) {
 
 	if err = g.Wait(); err != nil {
 		return nil, err
+	}
+
+	// now that parsing is finished, copy frequency info to cpus which are marked for copying
+	for i := range cpus {
+		if freqCopies[i].enabled {
+			systemCpufreq[i].copyFrom(&systemCpufreq[freqCopies[i].fromIndex])
+		}
 	}
 
 	return systemCpufreq, nil
